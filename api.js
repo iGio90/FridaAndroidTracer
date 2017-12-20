@@ -1,4 +1,4 @@
-function traceMethod(targetClassMethod) {
+function traceMethod(targetClassMethod, onPerformingHook) {
     var delim = targetClassMethod.lastIndexOf(".");
     if (delim === -1) return;
 
@@ -26,39 +26,7 @@ function traceMethod(targetClassMethod) {
 
             var args = arguments;
             Java.perform(function() {
-                if (typeof args[0] != 'undefined') {
-                    var hookMsg = {
-                        "function": targetClassMethod,
-                        "struct": {}
-                    };
-
-                    hookMsg["struct"]["args"] = [];
-                    for (var j = 0; j < args.length; j++) {
-                        try {
-                            hookMsg["struct"]["args"].push(JSON.parse(args[j]));
-                        } catch (err) {}
-                    }
-
-                    var uri = Java.use("android.net.Uri");
-                    var pt = ptr(args[0]["$handle"]);
-                    var uriCls = Java.cast(pt, uri);
-
-                    hookMsg["uri"] = uriCls.toString();
-
-                    if (args[1] && typeof args[1] != 'undefined') {
-                        var arrayUtils = Java.use("java.util.Arrays");
-                        var strArray = Java.use("[Ljava.lang.String;");
-                        pt = ptr(args[1]["$handle"]);
-                        var projections = Java.cast(pt, strArray);
-                        hookMsg["projection"] = arrayUtils.toString(projections);
-                    } else {
-                        hookMsg["projection"] = "None";
-                    }
-
-                    hookMsg["struct"]["backtrace"] = Java.use("android.util.Log")
-                        .getStackTraceString(Java.use("java.lang.Exception").$new());
-                    send(hookMsg);
-                }
+                onPerformingHook(targetClassMethod, args);
             });
             return retval;
         }
@@ -128,7 +96,6 @@ function traceModule(impl, name) {
     });
 }
 
-
 function traceNativeFunct(exp, funct, onEnterCb, onLeaveCb) {
     console.log("[*] Tracing native funct " + funct + " in " + exp);
 
@@ -172,6 +139,127 @@ function hex2a(hexx) {
     for (var i = 0; i < hex.length; i += 2)
         str += String.fromCharCode(parseInt(hex.substr(i, 2), 16));
     return str;
+}
+
+function getPortsAndAddresses(sockfd, isRead) {
+    var message = {};
+    var addrlen = Memory.alloc(4);
+    var addr = Memory.alloc(16);
+    var src_dst = ["src", "dst"];
+    for (var i = 0; i < src_dst.length; i++) {
+        Memory.writeU32(addrlen, 16);
+        if ((src_dst[i] == "src") ^ isRead) {
+            getsockname(sockfd, addr, addrlen);
+        } else {
+            getpeername(sockfd, addr, addrlen);
+        }
+        message[src_dst[i] + "_port"] = ntohs(Memory.readU16(addr.add(2)));
+        message[src_dst[i] + "_addr"] = ntohl(Memory.readU32(addr.add(4)));
+    }
+    return message;
+}
+
+function getSslSessionId(ssl) {
+    var session = SSL_get_session(ssl);
+    if (session == 0) {
+        return 0;
+    }
+    var len = Memory.alloc(4);
+    var p = SSL_SESSION_get_id(session, len);
+    len = Memory.readU32(len);
+    var session_id = "";
+    for (var i = 0; i < len; i++) {
+        session_id +=
+            ("0" + Memory.readU8(p.add(i)).toString(16).toUpperCase()).substr(-2);
+    }
+    return session_id;
+}
+
+function standardHookMethodPerform(targetClassMethod, args) {
+    var hookMsg = {
+        "function": targetClassMethod,
+        "struct": {}
+    };
+
+    hookMsg["struct"]["args"] = [];
+    for (var j = 0; j < args.length; j++) {
+        try {
+            hookMsg["struct"]["args"].push(JSON.parse(args[j]));
+        } catch (err) {}
+    }
+
+    hookMsg["struct"]["backtrace"] = Java.use("android.util.Log")
+        .getStackTraceString(Java.use("java.lang.Exception").$new());
+    send(hookMsg);
+}
+
+function onDumpIntentHookMethodPerform(targetClassMethod, args) {
+    if (typeof args[0] != 'undefined') {
+        var hookMsg = {
+            "function": targetClassMethod,
+            "struct": {}
+        };
+
+        hookMsg["struct"]["args"] = [];
+        for (var j = 0; j < args.length; j++) {
+            try {
+                hookMsg["struct"]["args"].push(JSON.parse(args[j]));
+            } catch (err) {}
+        }
+
+        var intent = Java.use("android.content.Intent");
+        var pt = ptr(args[0]["$handle"]);
+        var intentCls = Java.cast(pt, intent);
+
+        hookMsg["struct"]["action"] = intentCls.getAction();
+        hookMsg["struct"]["target_component"] = intentCls.getComponent().toString();
+        hookMsg["struct"]["backtrace"] = Java.use("android.util.Log")
+            .getStackTraceString(Java.use("java.lang.Exception").$new());
+        send(hookMsg);
+    }
+}
+
+function onDumpContentResolverHookMethodPerform(targetClassMethod, args) {
+    if (typeof args[0] != 'undefined') {
+        var hookMsg = {
+            "function": targetClassMethod,
+            "struct": {}
+        };
+
+        hookMsg["struct"]["args"] = [];
+        for (var j = 0; j < args.length; j++) {
+            try {
+                hookMsg["struct"]["args"].push(JSON.parse(args[j]));
+            } catch (err) {}
+        }
+
+        var uri = Java.use("android.net.Uri");
+        var pt = ptr(args[0]["$handle"]);
+        var uriCls = Java.cast(pt, uri);
+
+        hookMsg["uri"] = uriCls.toString();
+
+        try {
+            if (args.length > 1 && typeof args[1] != 'undefined') {
+                var arrayUtils = Java.use("java.util.Arrays");
+                var strArray = Java.use("[Ljava.lang.String;");
+                pt = ptr(args[1]["$handle"]);
+                var projections = Java.cast(pt, strArray);
+                hookMsg["projection"] = arrayUtils.toString(projections);
+            } else {
+                hookMsg["projection"] = "None";
+            }
+        } catch (err) {
+        }
+
+        hookMsg["struct"]["backtrace"] = Java.use("android.util.Log")
+            .getStackTraceString(Java.use("java.lang.Exception").$new());
+        send(hookMsg);
+    }
+}
+
+function exist(src, val) {
+    return src.toLowerCase().indexOf(val) != -1;
 }
 
 function initializeGlobals() {
@@ -233,48 +321,10 @@ function initializeGlobals() {
     ntohl = new NativeFunction(addresses["ntohl"], "uint32", ["uint32"]);
 }
 
-function getPortsAndAddresses(sockfd, isRead) {
-    var message = {};
-    var addrlen = Memory.alloc(4);
-    var addr = Memory.alloc(16);
-    var src_dst = ["src", "dst"];
-    for (var i = 0; i < src_dst.length; i++) {
-        Memory.writeU32(addrlen, 16);
-        if ((src_dst[i] == "src") ^ isRead) {
-            getsockname(sockfd, addr, addrlen);
-        } else {
-            getpeername(sockfd, addr, addrlen);
-        }
-        message[src_dst[i] + "_port"] = ntohs(Memory.readU16(addr.add(2)));
-        message[src_dst[i] + "_addr"] = ntohl(Memory.readU32(addr.add(4)));
-    }
-    return message;
-}
-
-function getSslSessionId(ssl) {
-    var session = SSL_get_session(ssl);
-    if (session == 0) {
-        return 0;
-    }
-    var len = Memory.alloc(4);
-    var p = SSL_SESSION_get_id(session, len);
-    len = Memory.readU32(len);
-    var session_id = "";
-    for (var i = 0; i < len; i++) {
-        session_id +=
-            ("0" + Memory.readU8(p.add(i)).toString(16).toUpperCase()).substr(-2);
-    }
-    return session_id;
-}
-
 function inject() {
     Java.perform(function () {
-        traceMethod("android.content.ContentResolver.query");
+        ::tp::
     });
-}
-
-function exist(src, val) {
-    return src.toLowerCase().indexOf(val) != -1;
 }
 
 setTimeout(function () {

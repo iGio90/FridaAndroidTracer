@@ -5,7 +5,6 @@ import frida
 import gplaycli
 import json
 import os
-import requests
 import sys
 import time
 
@@ -34,7 +33,7 @@ def exit_handler():
         # pending review
         report["staus"] = 0
         report["updated"] = int(round(time.time() * 1000))
-        with open("reports/" + package_name + "_" + report["version_code"] + ".json", 'w') \
+        with open("reports/" + package_name + "_" + report["app_info"]["version_code"] + ".json", 'w') \
                 as outfile:
             json.dump(report, outfile)
 
@@ -49,64 +48,81 @@ def run_cmd(cmd):
 
 atexit.register(exit_handler)
 
-parser = argparse.ArgumentParser(description='Trace app for SpotifApp.')
+parser = argparse.ArgumentParser(description='Tracer for Android built on top of Frida.')
 parser.add_argument('-p', '--package', help="Package name to start and trace.", required=True)
+parser.add_argument('-pd', '--package-download', help="Download and install package from Google Play Store.",
+                    action="store_true", default=False)
+parser.add_argument('-f', '--file-path', help="Specify apk file name for additional information.")
+parser.add_argument('-s', '--script-path', help="Inject a custom payload instead of the default tracer")
 args = parser.parse_args()
 
 package_name = args.package
+store_download = args.package_download
+file_path = args.file_path
+script_path = args.script_path
 
-cli = gplaycli.GPlaycli()
-success, error = cli.connect_to_googleplay_api()
-if not success:
-    print("Cannot login to GooglePlay ( %s )" % error)
-    sys.exit()
+apk_file = None
+cli = None
 
-if not os.path.exists("apk_files"):
-    os.mkdir("apk_files")
+if store_download:
+    cli = gplaycli.GPlaycli()
+    success, error = cli.connect_to_googleplay_api()
+    if not success:
+        print("Cannot login to GooglePlay ( %s )" % error)
+        sys.exit()
 
-cli.set_download_folder("apk_files")
-pkg_arr = [package_name]
-cli.download_packages(pkg_arr)
+    if not os.path.exists("apk_files"):
+        os.mkdir("apk_files")
 
-apk_file = "apk_files/" + package_name + ".apk"
+    cli.set_download_folder("apk_files")
+    pkg_arr = [package_name]
+    cli.download_packages(pkg_arr)
 
-if not os.path.isfile(apk_file):
-    print("Failed to download " + package_name + " from store.")
-    sys.exit()
+    apk_file = "apk_files/" + package_name + ".apk"
 
-# generate info
-print("[*] Collecting info")
-apk_info = APK(apk_file)
-store_info = cli.get_package_info(package_name)
+    if not os.path.isfile(apk_file):
+        print("Failed to download " + package_name + " from store.")
+        sys.exit()
+elif file_path:
+    apk_file = file_path
 
 report = {
     "package": package_name,
-    "md5": apk_info.file_md5,
-    "cert_md5": apk_info.cert_md5,
-    "file_size": apk_info.file_size,
-    "version_name": apk_info.get_androidversion_name(),
-    "version_code": apk_info.get_androidversion_code(),
-    "main_activity": apk_info.get_main_activity(),
-    "activities": apk_info.get_activities(),
-    "services": apk_info.get_services(),
-    "receivers": apk_info.get_receivers(),
-    "providers": apk_info.get_providers(),
-    "permissions": apk_info.get_permissions(),
-    "certificates": [],
-    "store_info": {
-        "downloads": store_info["numDownloads"],
-        "date": store_info["uploadDate"],
-        "ads": store_info["containsAds"] == 'Contains ads',
-        "app_apptype": store_info["category"]["appType"],
-        "app_category": store_info["category"]["appCategory"]
-    }
 }
 
-for image in store_info["images"]:
-    if image["imageType"] == 4:
-        report["store_info"]["icon_url"] = image["url"]
+if apk_file is not None:
+    # generate info
+    print("[*] Collecting app info")
+    apk_info = APK(apk_file)
+    report["app_info"] = {
+        "md5": apk_info.file_md5,
+        "cert_md5": apk_info.cert_md5,
+        "file_size": apk_info.file_size,
+        "version_name": apk_info.get_androidversion_name(),
+        "version_code": apk_info.get_androidversion_code(),
+        "main_activity": apk_info.get_main_activity(),
+        "activities": apk_info.get_activities(),
+        "services": apk_info.get_services(),
+        "receivers": apk_info.get_receivers(),
+        "providers": apk_info.get_providers(),
+        "permissions": apk_info.get_permissions(),
+        "certificates": []
+    }
 
-report["certificates"].append(apk_info.cert_text)
+    report["app_info"]["certificates"].append(apk_info.cert_text)
+
+    if cli is not None:
+        store_info = cli.get_package_info(package_name)
+        report["store_info"] = {
+            "downloads": store_info["numDownloads"],
+            "date": store_info["uploadDate"],
+            "ads": store_info["containsAds"] == 'Contains ads',
+            "app_apptype": store_info["category"]["appType"],
+            "app_category": store_info["category"]["appCategory"]
+        }
+        for image in store_info["images"]:
+            if image["imageType"] == 4:
+                report["store_info"]["icon_url"] = image["url"]
 
 # start frida server
 run_cmd("adb shell su -c setenforce 0")
@@ -124,11 +140,16 @@ run_cmd("adb shell pm grant " + package_name + " android.permission.ACCESS_COARS
 run_cmd("adb shell pm grant " + package_name + " android.permission.ACCESS_FINE_LOCATION")
 run_cmd("adb shell monkey -p " + package_name + " -c android.intent.category.LAUNCHER 1")
 
+js_api = open('api.js', "r").read()
+
+if script_path:
+    str.replace(js_api, '::tp::', open(script_path, "r").read())
+else:
+    str.replace(js_api, '::tp::', open('tracer_defaults', "r").read())
+
 process = frida.get_usb_device().attach(package_name)
-print("Frida attached.")
-script = process.create_script(open("dumper.js", "r").read())
-print("Dumper loaded.")
+script = process.create_script(open(script_path, "r").read())
 script.on('message', parse_message)
-print("parse_message registered within script object.")
+print("Tracer injected into " + package_name + ". Break to generate the report.")
 script.load()
 sys.stdin.read()

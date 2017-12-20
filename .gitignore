@@ -64,3 +64,9 @@ apk_files
 reports
 test.py
 backend.py
+.idea/SpotifApp_Tracer.iml
+.idea/markdown-navigator/
+.idea/misc.xml
+.idea/modules.xml
+.idea/workspace.xml
+files/
