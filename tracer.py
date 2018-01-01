@@ -9,6 +9,11 @@ import sys
 import time
 
 
+report = {}
+apk_file = None
+cli = None
+
+
 def parse_message(message, data):
     if "payload" not in message:
         print(message)
@@ -30,15 +35,16 @@ def exit_handler():
         os.mkdir("reports")
 
     if report:
-        # pending review
         report["staus"] = 0
         report["updated"] = int(round(time.time() * 1000))
         with open("reports/" + package_name + "_" + report["app_info"]["version_code"] + ".json", 'w') \
                 as outfile:
             json.dump(report, outfile)
 
-    run_cmd("adb shell am force-stop " + package_name)
-    if os.path.isfile(apk_file):
+    if "package_name" in report:
+        run_cmd("adb shell am force-stop " + package_name)
+
+    if apk_file and os.path.isfile(apk_file):
         os.remove(apk_file)
 
 
@@ -60,9 +66,6 @@ package_name = args.package
 store_download = args.package_download
 file_path = args.file_path
 script_path = args.script_path
-
-apk_file = None
-cli = None
 
 if store_download:
     cli = gplaycli.GPlaycli()
@@ -86,9 +89,7 @@ if store_download:
 elif file_path:
     apk_file = file_path
 
-report = {
-    "package": package_name,
-}
+report["package"] = package_name
 
 if apk_file is not None:
     # generate info
