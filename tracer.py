@@ -131,8 +131,9 @@ run_cmd("adb shell su -c killall -9 frida")
 run_cmd("adb shell su -c frida &")
 
 # install the app
-print("[*] Installing " + package_name)
-run_cmd("adb install -r " + apk_file)
+if apk_file:
+    print("[*] Installing " + package_name)
+    run_cmd("adb install -r " + apk_file)
 
 print("[*] Killing " + package_name)
 run_cmd("adb shell am force-stop " + package_name)
@@ -144,12 +145,12 @@ run_cmd("adb shell monkey -p " + package_name + " -c android.intent.category.LAU
 js_api = open('api.js', "r").read()
 
 if script_path:
-    str.replace(js_api, '::tp::', open(script_path, "r").read())
+    js_api = str.replace(js_api, '::tp::', open(script_path, "r").read())
 else:
-    str.replace(js_api, '::tp::', open('tracer_defaults', "r").read())
+    js_api = str.replace(js_api, '::tp::', open('tracer_defaults.js', "r").read())
 
 process = frida.get_usb_device().attach(package_name)
-script = process.create_script(open(script_path, "r").read())
+script = process.create_script(js_api)
 script.on('message', parse_message)
 print("Tracer injected into " + package_name + ". Break to generate the report.")
 script.load()
