@@ -37,7 +37,11 @@ def exit_handler():
     if report:
         report["staus"] = 0
         report["updated"] = int(round(time.time() * 1000))
-        with open("reports/" + package_name + "_" + report["app_info"]["version_code"] + ".json", 'w') \
+        if "app_info" in report:
+            report_name = package_name + "_" + report["app_info"]["version_code"] + ".json"
+        else:
+            report_name = package_name + ".json"
+        with open("reports/" + report_name, 'w') \
                 as outfile:
             json.dump(report, outfile)
 
