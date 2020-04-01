@@ -136,9 +136,9 @@ if apk_file is not None:
         store_info = cli.get_package_info(package_name)
         details = store_info['details']['appDetails']
         report["details"] = store_info['details']['appDetails']
-        for image in store_info["images"]:
+        for image in store_info["image"]:
             if image["imageType"] == 4:
-                report["store_info"]["icon_url"] = image["url"]
+                report["store_info"]["icon_url"] = image["imageUrl"]
 
 # install the app
 if apk_file:
