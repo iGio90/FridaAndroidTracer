@@ -148,7 +148,6 @@ if apk_file:
 print("[*] Giving permissions to " + package_name)
 run_cmd("adb shell pm grant " + package_name + " android.permission.ACCESS_COARSE_LOCATION")
 run_cmd("adb shell pm grant " + package_name + " android.permission.ACCESS_FINE_LOCATION")
-run_cmd("adb shell monkey -p " + package_name + " -c android.intent.category.LAUNCHER 1")
 
 print("[*] Starting " + package_name)
 
