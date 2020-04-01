@@ -23,10 +23,10 @@ function traceMethod(targetClassMethod, onPerformingHook) {
     for (var i = 0; i < overloadCount; i++) {
         hook[targetMethod].overloads[i].implementation = function() {
             var retval = this[targetMethod].apply(this, arguments);
-
             var args = arguments;
+            var context = this;
             Java.perform(function() {
-                onPerformingHook(targetClassMethod, args);
+                onPerformingHook(targetClassMethod, args, context);
             });
             return retval;
         }
@@ -161,7 +161,7 @@ function getPortsAndAddresses(sockfd, isRead) {
 
 function getSslSessionId(ssl) {
     var session = SSL_get_session(ssl);
-    if (session == 0) {
+    if (session === 0) {
         return 0;
     }
     var len = Memory.alloc(4);
@@ -184,9 +184,32 @@ function standardHookMethodPerform(targetClassMethod, args) {
     hookMsg["struct"]["args"] = [];
     for (var j = 0; j < args.length; j++) {
         try {
-            hookMsg["struct"]["args"].push(JSON.parse(args[j]));
+            hookMsg["struct"]["args"].push(JSON.stringify(args[j]));
         } catch (err) {}
     }
+
+    hookMsg["struct"]["backtrace"] = Java.use("android.util.Log")
+        .getStackTraceString(Java.use("java.lang.Exception").$new());
+    send(hookMsg);
+}
+
+function cipherHookMethodPerform(targetClassMethod, args, context) {
+    var hookMsg = {
+        "function": targetClassMethod,
+        "struct": {}
+    };
+
+    var s = '';
+    try {
+        s = Java.use('java.lang.String').$new(args[0]).toString();
+    } catch (e) {}
+    hookMsg["struct"]["args"] = [
+        {
+            'cipher': context.transformation.value,
+            'bytes': ba2hex(new Uint8Array(args[0]).buffer),
+            'string': s
+        }
+    ];
 
     hookMsg["struct"]["backtrace"] = Java.use("android.util.Log")
         .getStackTraceString(Java.use("java.lang.Exception").$new());
@@ -229,15 +252,11 @@ function onDumpContentResolverHookMethodPerform(targetClassMethod, args) {
         hookMsg["struct"]["args"] = [];
         for (var j = 0; j < args.length; j++) {
             try {
-                hookMsg["struct"]["args"].push(JSON.parse(args[j]));
+                hookMsg["struct"]["args"].push(args[j].toString());
             } catch (err) {}
         }
 
-        var uri = Java.use("android.net.Uri");
-        var pt = ptr(args[0]["$handle"]);
-        var uriCls = Java.cast(pt, uri);
-
-        hookMsg["uri"] = uriCls.toString();
+        hookMsg["uri"] = args[0].toString();
 
         try {
             if (args.length > 1 && typeof args[1] != 'undefined') {

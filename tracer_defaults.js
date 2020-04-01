@@ -27,26 +27,12 @@ traceMethod("android.app.Activity.startActivityForResult", onDumpIntentHookMetho
 
 traceMethod("android.content.ContentResolver.query", onDumpContentResolverHookMethodPerform);
 
+traceMethod("javax.crypto.Cipher.doFinal", cipherHookMethodPerform);
+
 traceClassCtor("java.io.File", {
     "stringsOnly": true,
     "backtrace": false
 });
-
-traceNativeFunct("libc.so", "send", function (args) {
-    var len = parseInt(args[2]);
-    var str = hex2a(ba2hex((Memory.readByteArray(args[1], len))));
-    if (exist(str, "http")) {
-        var sendMessage = {};
-        try {
-            sendMessage = getPortsAndAddresses(args[0], true);
-        } catch (err) {}
-
-        sendMessage["function"] = "send";
-        sendMessage["struct"] = {};
-        sendMessage["struct"]["data"] = str;
-        send(sendMessage);
-    }
-}, function (retval) {});
 
 traceNativeFunct("libc.so", "open", function (args) {
     var path = Memory.readUtf8String(args[0]);
@@ -137,3 +123,20 @@ Interceptor.attach(addresses["SSL_write"], {
     onLeave: function (retval) {
     }
 });
+
+traceNativeFunct("libc.so", "send", function (args) {
+    var len = parseInt(args[2]);
+    var str = hex2a(ba2hex((Memory.readByteArray(args[1], len))));
+    if (exist(str, "http")) {
+        var sendMessage = {};
+        try {
+            sendMessage = getPortsAndAddresses(args[0], true);
+        } catch (err) {}
+
+        sendMessage["function"] = "send";
+        sendMessage["struct"] = {};
+        sendMessage["struct"]["data"] = str;
+        send(sendMessage);
+    }
+}, function (retval) {});
+
