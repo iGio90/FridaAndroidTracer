@@ -1,3 +1,17 @@
+"""
+    Dwarf - Copyright (C) 2020 Giovanni - iGio90 - Rocca
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+    You should have received a copy of the GNU General Public License
+    along with this program.
+    If not, see <https://www.gnu.org/licenses/>
+"""
 from apk_parse.apk import APK
 import atexit
 import argparse
@@ -43,7 +57,7 @@ def exit_handler():
             report_name = package_name + ".json"
         with open("reports/" + report_name, 'w') \
                 as outfile:
-            json.dump(report, outfile)
+            json.dump(report, outfile, indent=2)
 
     if "package_name" in report:
         run_cmd("adb shell am force-stop " + package_name)
@@ -72,8 +86,9 @@ file_path = args.file_path
 script_path = args.script_path
 
 if store_download:
+    print('Google Play: Logging in...')
     cli = gplaycli.GPlaycli()
-    success, error = cli.connect_to_googleplay_api()
+    success, error = cli.connect()
     if not success:
         print("Cannot login to GooglePlay ( %s )" % error)
         sys.exit()
@@ -81,9 +96,10 @@ if store_download:
     if not os.path.exists("apk_files"):
         os.mkdir("apk_files")
 
-    cli.set_download_folder("apk_files")
+    print('Google Play: downloading', package_name, 'please wait...')
+    cli.download_folder = "apk_files"
     pkg_arr = [package_name]
-    cli.download_packages(pkg_arr)
+    cli.download(pkg_arr)
 
     apk_file = "apk_files/" + package_name + ".apk"
 
@@ -118,44 +134,36 @@ if apk_file is not None:
 
     if cli is not None:
         store_info = cli.get_package_info(package_name)
-        report["store_info"] = {
-            "downloads": store_info["numDownloads"],
-            "date": store_info["uploadDate"],
-            "ads": store_info["containsAds"] == 'Contains ads',
-            "app_apptype": store_info["category"]["appType"],
-            "app_category": store_info["category"]["appCategory"]
-        }
+        details = store_info['details']['appDetails']
+        report["details"] = store_info['details']['appDetails']
         for image in store_info["images"]:
             if image["imageType"] == 4:
                 report["store_info"]["icon_url"] = image["url"]
-
-# start frida server
-run_cmd("adb shell su -c setenforce 0")
-run_cmd("adb shell su -c killall -9 frida")
-run_cmd("adb shell su -c frida &")
 
 # install the app
 if apk_file:
     print("[*] Installing " + package_name)
     run_cmd("adb install -r " + apk_file)
 
-print("[*] Killing " + package_name)
-run_cmd("adb shell am force-stop " + package_name)
-print("[*] Starting " + package_name)
+print("[*] Giving permissions to " + package_name)
 run_cmd("adb shell pm grant " + package_name + " android.permission.ACCESS_COARSE_LOCATION")
 run_cmd("adb shell pm grant " + package_name + " android.permission.ACCESS_FINE_LOCATION")
 run_cmd("adb shell monkey -p " + package_name + " -c android.intent.category.LAUNCHER 1")
 
-js_api = open('api.js', "r").read()
+print("[*] Starting " + package_name)
 
+js_api = open('api.js', "r").read()
 if script_path:
     js_api = str.replace(js_api, '::tp::', open(script_path, "r").read())
 else:
     js_api = str.replace(js_api, '::tp::', open('tracer_defaults.js', "r").read())
 
-process = frida.get_usb_device().attach(package_name)
-script = process.create_script(js_api)
+d = frida.get_usb_device()
+pid = d.spawn(package_name)
+session = d.attach(pid)
+script = session.create_script(js_api)
 script.on('message', parse_message)
-print("Tracer injected into " + package_name + ". Break to generate the report.")
 script.load()
+d.resume(pid)
+
 sys.stdin.read()

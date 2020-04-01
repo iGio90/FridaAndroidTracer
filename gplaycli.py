@@ -16,21 +16,23 @@ You should have received a copy of the GNU Affero General Public License along w
 see <http://www.gnu.org/licenses/>.
 """
 
-import sys
 import os
+import sys
+import site
+import json
+import enum
+import logging
 import argparse
 import requests
-import shutil
-import stat
 import configparser
 
-from enum import IntEnum
-from gpapi.googleplay import GooglePlayAPI
-from gpapi.googleplay import LoginError
+from gpapi.googleplay import GooglePlayAPI, LoginError, RequestError
+from google.protobuf.message import DecodeError
 from pkg_resources import get_distribution, DistributionNotFound
 from pyaxmlparser import APK
 
 import util
+import hooks
 
 try:
     import keyring
@@ -44,423 +46,590 @@ try:
 except DistributionNotFound:
     __version__ = 'unknown: gplaycli not installed (version in setup.py)'
 
+logger  = logging.getLogger(__name__)  # default level is WARNING
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+logger.addHandler(handler)
+logger.propagate = False
 
-class ERRORS(IntEnum):
-    OK = 0
+
+class ERRORS(enum.IntEnum):
+    """
+    Contains constant errors for Gplaycli
+    """
+    SUCCESS = 0
     TOKEN_DISPENSER_AUTH_ERROR = 5
     TOKEN_DISPENSER_SERVER_ERROR = 6
     KEYRING_NOT_INSTALLED = 10
     CANNOT_LOGIN_GPLAY = 15
 
 
-class GPlaycli(object):
-    def __init__(self, args=None, credentials=None):
+class GPlaycli:
+    """
+    Object which handles Google Play connection
+    search and download.
+    GPlaycli can be used as an API with parameters
+    token_enable, token_url, config and with methods
+    retrieve_token(), connect(),
+    download(), search().
+    """
+
+    def __init__(self, args=None, config_file=None):
         # no config file given, look for one
-        if credentials is None:
+        if config_file is None:
             # default local user configs
             cred_paths_list = [
-                'gplaycli.conf',
-                os.path.expanduser("~") + '/.config/gplaycli/gplaycli.conf',
-                '/etc/gplaycli/gplaycli.conf'
+                os.getcwd(),
+                os.path.join(site.USER_BASE, 'etc', 'gplaycli'),
+                os.path.join(sys.prefix, 'local', 'etc', 'gplaycli'),
+                os.path.join('/etc', 'gplaycli')
             ]
-            tmp_list = list(cred_paths_list)
-            while not os.path.isfile(tmp_list[0]):
-                tmp_list.pop(0)
-                if not tmp_list:
-                    raise OSError("No configuration file found at %s" % cred_paths_list)
-            credentials = tmp_list[0]
+            for filepath in cred_paths_list:
+                if os.path.isfile(os.path.join(filepath, 'gplaycli.conf')):
+                    config_file = os.path.join(filepath, 'gplaycli.conf')
+                    break
+            if config_file is None:
+                logger.warn("No configuration file gplaycli.conf found at %s, using default values" % cred_paths_list)
 
-        default_values = dict()
-        self.configparser = configparser.ConfigParser(default_values)
-        self.configparser.read(credentials)
-        self.config = {key: value for key, value in self.configparser.items("Credentials")}
+        self.api 			= None
+        self.token_passed 	= False
 
-        self.tokencachefile = os.path.expanduser(self.configparser.get("Cache", "token"))
-        self.playstore_api = None
 
-        # default settings, ie for API calls
-        if args is None:
-            self.yes = True
-            self.verbose = True
-            self.progress_bar = True
-            self.device_codename = 'bacon'
-            self.addfiles_enable = False
-            self.token_enable = self.configparser.getboolean('Credentials', 'token')
-            self.token_url = self.configparser.get('Credentials', 'token_url')
-            self.token, self.gsfid = self.retrieve_token()
+        config = configparser.ConfigParser()
+        if config_file:
+            config.read(config_file)
+        self.gmail_address      = config.get('Credentials', 'gmail_address', fallback=None)
+        self.gmail_password		= config.get('Credentials', 'gmail_password', fallback=None)
+        self.token_enable 		= config.getboolean('Credentials', 'token', fallback=True)
+        self.token_url 			= config.get('Credentials', 'token_url', fallback='https://matlink.fr/token/email/gsfid')
+        self.keyring_service    = config.get('Credentials', 'keyring_service', fallback=None)
 
-        # if args are passed
-        else:
-            self.yes = args.yes_to_all
+        self.tokencachefile 	= os.path.expanduser(config.get("Cache", "token", fallback="token.cache"))
+        self.yes 				= config.getboolean('Misc', 'accept_all', fallback=False)
+        self.verbose 			= config.getboolean('Misc', 'verbose', fallback=False)
+        self.append_version 	= config.getboolean('Misc', 'append_version', fallback=False)
+        self.progress_bar 		= config.getboolean('Misc', 'progress', fallback=False)
+        self.logging_enable 	= config.getboolean('Misc', 'enable_logging', fallback=False)
+        self.addfiles_enable 	= config.getboolean('Misc', 'enable_addfiles', fallback=False)
+        self.device_codename 	= config.get('Device', 'codename', fallback='bacon')
+        self.locale 			= config.get("Locale", "locale", fallback="en_GB")
+        self.timezone 			= config.get("Locale", "timezone", fallback="CEST")
+
+        if not args: return
+
+        # if args are passed, override defaults
+        if args.yes is not None:
+            self.yes = args.yes
+
+        if args.verbose is not None:
             self.verbose = args.verbose
-            self.progress_bar = args.progress_bar
-            self.set_download_folder(args.update_folder)
+
+        if self.verbose:
+            logger.setLevel(logging.INFO)
+        logger.info('GPlayCli version %s', __version__)
+        logger.info('Configuration file is %s', config_file)
+
+        if args.append_version is not None:
+            self.append_version = args.append_version
+
+        if args.progress is not None:
+            self.progress_bar = args.progress
+
+        if args.update is not None:
+            self.download_folder = args.update
+
+        if args.log is not None:
+            self.logging_enable = args.log
+
+        if args.device_codename is not None:
             self.device_codename = args.device_codename
-            self.addfiles_enable = args.addfiles_enable
-            if args.token_enable is None:
-                self.token_enable = self.configparser.getboolean('Credentials', 'token')
+        logger.info('Device is %s', self.device_codename)
+
+        if args.additional_files is not None:
+            self.addfiles_enable = args.additional_files
+
+        if args.token is not None:
+            self.token_enable = args.token
+        if self.token_enable is not None:
+            if args.token_url is not None:
+                self.token_url = args.token_url
+            if (args.token_str is not None) and (args.gsfid is not None):
+                self.token = args.token_str
+                self.gsfid = args.gsfid
+                self.token_passed = True
+            elif args.token_str is None and args.gsfid is None:
+                pass
             else:
-                self.token_enable = args.token_enable
-            if self.token_enable:
-                if args.token_url is None:
-                    self.token_url = self.configparser.get('Credentials', 'token_url')
-                else:
-                    self.token_url = args.token_url
-                self.token, self.gsfid = self.retrieve_token()
+                raise TypeError("Token string and GSFID have to be passed at the same time.")
 
-    def get_cached_token(self):
-        try:
-            with open(self.tokencachefile, 'r') as tcf:
-                token, gsfid = tcf.readline().split()
-                if not token:
-                    token = None
-                    gsfid = None
-        except (IOError, ValueError):  # cache file does not exists or is corrupted
-            token = None
-            gsfid = None
-        return token, gsfid
+        if self.logging_enable:
+            self.success_logfile = "apps_downloaded.log"
+            self.failed_logfile  = "apps_failed.log"
+            self.unavail_logfile = "apps_not_available.log"
 
-    def write_cached_token(self, token, gsfid):
-        try:
-            # creates cachedir if not exists
-            cachedir = os.path.dirname(self.tokencachefile)
-            if not os.path.exists(cachedir):
-                os.mkdir(cachedir)
-            with open(self.tokencachefile, 'w') as tcf:
-                tcf.write("%s %s" % (token, gsfid))
-        except IOError as e:
-            raise IOError("Failed to write token to cache file: %s %s" % (self.tokencachefile, e.strerror))
+    ########## Public methods ##########
 
     def retrieve_token(self, force_new=False):
-        token, gsfid = self.get_cached_token()
-        if token is not None and not force_new:
-            return token, gsfid
-        r = requests.get(self.token_url)
-        if r.text == 'Auth error':
-            print('Token dispenser auth error, probably too many connections')
-            sys.exit(ERRORS.TOKEN_DISPENSER_AUTH_ERROR)
-        elif r.text == "Server error":
-            print('Token dispenser server error')
-            sys.exit(ERRORS.TOKEN_DISPENSER_SERVER_ERROR)
-        token, gsfid = r.text.split(" ")
-        self.token = token
-        self.gsfid = gsfid
-        self.write_cached_token(token, gsfid)
-        return token, gsfid
+        """
+        Return a token. If a cached token exists,
+        it will be used. Else, or if force_new=True,
+        a new token is fetched from the token-dispenser
+        server located at self.token_url.
+        """
+        self.token, self.gsfid, self.gmail_address = self.get_cached_token()
+        if (self.token is not None and not force_new):
+            logger.info("Using cached token.")
+            self.gsfid = hex(self.api.checkin(self.gmail_address, self.token))[2:]
+            return
 
-    def set_download_folder(self, folder):
-        self.config["download_folder_path"] = folder
-
-    def connect_to_googleplay_api(self):
-        self.playstore_api = GooglePlayAPI(device_codename=self.device_codename)
-        error = None
-        email = None
-        password = None
-        authSubToken = None
-        gsfId = None
-        if self.token_enable is False:
-            email = self.config["gmail_address"]
-            if self.config["gmail_password"]:
-                password = self.config["gmail_password"]
-            elif self.config["keyring_service"] and HAVE_KEYRING is True:
-                password = keyring.get_password(self.config["keyring_service"], email)
-            elif self.config["keyring_service"] and HAVE_KEYRING is False:
-                print("You asked for keyring service but keyring package is not installed")
-                sys.exit(ERRORS.KEYRING_NOT_INSTALLED)
+        logger.info("Retrieving token ...")
+        logger.info("Token URL is %s", self.token_url)
+        email_url = '/'.join([self.token_url, 'email'])
+        response = requests.get(email_url)
+        if response.status_code == 200:
+            self.gmail_address = response.text
         else:
-            authSubToken = self.token
-            gsfId = int(self.gsfid, 16)
-        try:
-            self.playstore_api.login(email=email,
-                                     password=password,
-                                     authSubToken=authSubToken,
-                                     gsfId=gsfId)
-        except (ValueError, IndexError, LoginError) as ve:  # invalid token or expired
-            self.retrieve_token(force_new=True)
-            self.playstore_api.login(authSubToken=self.token, gsfId=int(self.gsfid, 16))
-        success = True
-        return success, error
+            logger.error("Cannot retrieve email address from token dispenser")
+            raise ERRORS.TOKEN_DISPENSER_SERVER_ERROR
 
-    def list_folder_apks(self, folder):
-        list_of_apks = [filename for filename in os.listdir(folder) if filename.endswith(".apk")]
-        return list_of_apks
+        token_url = '/'.join([self.token_url, 'token/email', self.gmail_address])
+        response = requests.get(token_url)
 
-    def prepare_analyse_apks(self):
-        download_folder_path = self.config["download_folder_path"]
-        list_of_apks = [filename for filename in os.listdir(download_folder_path) if
-                        os.path.splitext(filename)[1] == ".apk"]
-        if list_of_apks:
-            self.analyse_local_apks(list_of_apks, self.playstore_api, download_folder_path,
-                                    self.prepare_download_updates)
+        if response.status_code == 200:
+            self.token = response.text
+            self.gsfid = hex(self.api.checkin(self.gmail_address, self.token))[2:]
+            logger.info("Email: %s", self.gmail_address)
+            logger.info("Token: %s", self.token)
+            logger.info("GsfId: %s", self.gsfid)
+            self.write_cached_token(self.token, self.gsfid, self.gmail_address)
+        else:
+            logger.error("Token dispenser server error: %s", response.status_code)
+            raise ERRORS.TOKEN_DISPENSER_SERVER_ERROR
 
-    def analyse_local_apks(self, list_of_apks, playstore_api, download_folder_path, return_function):
-        list_apks_to_update = []
-        package_bunch = []
-        version_codes = []
-        for position, filename in enumerate(list_of_apks):
-            filepath = os.path.join(download_folder_path, filename)
-            a = APK(filepath)
-            packagename = a.package
-            package_bunch.append(packagename)
-            version_codes.append(a.version_code)
+    def get_package_info(self, package):
+        return self.api.details(package)
+
+    @hooks.connected
+    def download(self, pkg_todownload):
+        """
+        Download apks from the pkg_todownload list
+
+        pkg_todownload -- list either of app names or
+        of tuple of app names and filepath to write them
+
+        Example: ['org.mozilla.focus','org.mozilla.firefox'] or
+                 [('org.mozilla.focus', 'org.mozilla.focus.apk'),
+                  ('org.mozilla.firefox', 'download/org.mozilla.firefox.apk')]
+        """
+        success_downloads = []
+        failed_downloads  = []
+        unavail_downloads = []
+
+        # case where no filenames have been provided
+        for index, pkg in enumerate(pkg_todownload):
+            if isinstance(pkg, str):
+                pkg_todownload[index] = [pkg, None]
+            # remove whitespaces before and after package name
+            pkg_todownload[index][0] = pkg_todownload[index][0].strip()
+
+        # Check for download folder
+        download_folder = self.download_folder
+        if not os.path.isdir(download_folder):
+            os.makedirs(download_folder, exist_ok=True)
 
         # BulkDetails requires only one HTTP request
         # Get APK info from store
-        details = playstore_api.bulkDetails(package_bunch)
-        for detail, packagename, apk_version_code in zip(details, package_bunch, version_codes):
-            store_version_code = detail['versionCode']
+        details = list()
+        for pkg in pkg_todownload:
+            try:
+                detail = self.api.details(pkg[0])
+                details.append(detail)
+            except RequestError as request_error:
+                failed_downloads.append((pkg, request_error))
 
-            # Compare
-            if apk_version_code != "" and int(apk_version_code) < int(store_version_code) and int(
-                    store_version_code) != 0:
-                # Add to the download list
-                list_apks_to_update.append([packagename, filename, int(apk_version_code), int(store_version_code)])
+        if any([d is None for d in details]):
+            logger.info("Token has expired while downloading. Retrieving a new one.")
+            self.refresh_token()
+            details = self.api.bulkDetails([pkg[0] for pkg in pkg_todownload])
 
-        return_function(list_apks_to_update)
-
-    def prepare_download_updates(self, list_apks_to_update):
-        if list_apks_to_update:
-            list_of_packages_to_download = []
-
-            # Ask confirmation before downloading
-            message = "The following applications will be updated :"
-            for packagename, filename, apk_version_code, store_version_code in list_apks_to_update:
-                message += "\n%s Version : %s -> %s" % (filename, apk_version_code, store_version_code)
-                list_of_packages_to_download.append([packagename, filename])
-            message += "\n"
-            print(message)
-            if not self.yes:
-                print("\nDo you agree?")
-                return_value = input('y/n ?')
-
-            if self.yes or return_value == 'y':
-                downloaded_packages = self.download_selection(self.playstore_api, list_of_packages_to_download,
-                                                              self.after_download)
-                return_string = str()
-                for package in downloaded_packages:
-                    return_string += package + " "
-                print("Updated: " + return_string[:-1])
-        else:
-            print("Everything is up to date !")
-            sys.exit(ERRORS.OK)
-
-    def download_selection(self, playstore_api, list_of_packages_to_download, return_function):
-        success_downloads = list()
-        failed_downloads = list()
-        unavail_downloads = list()
-
-        # BulkDetails requires only one HTTP request
-        # Get APK info from store
-        details = playstore_api.bulkDetails([pkg[0] for pkg in list_of_packages_to_download])
-        position = 1
-        for detail, item in zip(details, list_of_packages_to_download):
+        for position, (detail, item) in enumerate(zip(details, pkg_todownload)):
             packagename, filename = item
 
-            # Check for download folder
-            download_folder_path = self.config["download_folder_path"]
-            if not os.path.isdir(download_folder_path):
-                os.mkdir(download_folder_path)
+            if filename is None:
+                if self.append_version:
+                    filename = "%s-v.%s.apk" % (detail['docid'], detail['details']['appDetails']['versionString'])
+                else:
+                    filename = "%s.apk" % detail['docid']
 
-            # Get the version code and the offer type from the app details
-            # m = playstore_api.details(packagename)
-            vc = detail['versionCode']
+            logger.info("%s / %s %s", 1+position, len(pkg_todownload), packagename)
 
             # Download
             try:
-                data_dict = playstore_api.download(packagename, vc, progress_bar=self.progress_bar, expansion_files=self.addfiles_enable)
+                if detail['offer'][0]['checkoutFlowRequired']:
+                    method = self.api.delivery
+                else:
+                    method = self.api.download
+                data_iter = method(packagename, expansion_files=self.addfiles_enable)
                 success_downloads.append(packagename)
             except IndexError as exc:
-                print("Error while downloading %s : %s" % (packagename,
-                                                           "this package does not exist, "
-                                                           "try to search it via --search before"))
+                logger.error("Error while downloading %s : this package does not exist, "
+                             "try to search it via --search before",
+                             packagename)
                 unavail_downloads.append((item, exc))
+                continue
             except Exception as exc:
-                print("Error while downloading %s : %s" % (packagename, exc))
+                logger.error("Error while downloading %s : %s", packagename, exc)
                 failed_downloads.append((item, exc))
-            else:
-                if filename is None:
-                    filename = packagename + ".apk"
-                filepath = os.path.join(download_folder_path, filename)
+                continue
 
-                data = data_dict['data']
-                additional_data = data_dict['additionalData']
+            filepath = os.path.join(download_folder, filename)
 
-                try:
-                    open(filepath, "wb").write(data)
-                    if additional_data:
-                        for obb_file in additional_data:
-                            obb_filename = "%s.%s.%s.obb" % (obb_file["type"], obb_file["versionCode"], data_dict["docId"])
-                            obb_filename = os.path.join(download_folder_path, obb_filename)
-                            open(obb_filename, "wb").write(obb_file["data"])
-                except IOError as exc:
-                    print("Error while writing %s : %s" % (packagename, exc))
-                    failed_downloads.append((item, exc))
-            position += 1
+            #if file exists, continue
+            if self.append_version and os.path.isfile(filepath):
+                logger.info("File %s already exists, skipping.", filename)
+                continue
+
+            additional_data = data_iter['additionalData']
+            splits = data_iter['splits']
+            total_size = int(data_iter['file']['total_size'])
+            chunk_size = int(data_iter['file']['chunk_size'])
+            try:
+                with open(filepath, "wb") as fbuffer:
+                    bar = util.progressbar(expected_size=total_size, hide=not self.progress_bar)
+                    for index, chunk in enumerate(data_iter['file']['data']):
+                        fbuffer.write(chunk)
+                        bar.show(index * chunk_size)
+                    bar.done()
+                if additional_data:
+                    for obb_file in additional_data:
+                        obb_filename = "%s.%s.%s.obb" % (obb_file["type"], obb_file["versionCode"], data_iter["docId"])
+                        obb_filename = os.path.join(download_folder, obb_filename)
+                        obb_total_size = int(obb_file['file']['total_size'])
+                        obb_chunk_size = int(obb_file['file']['chunk_size'])
+                        with open(obb_filename, "wb") as fbuffer:
+                            bar = util.progressbar(expected_size=obb_total_size, hide=not self.progress_bar)
+                            for index, chunk in enumerate(obb_file["file"]["data"]):
+                                fbuffer.write(chunk)
+                                bar.show(index * obb_chunk_size)
+                            bar.done()
+                if splits:
+                    for split in splits:
+                        split_total_size = int(split['file']['total_size'])
+                        split_chunk_size = int(split['file']['chunk_size'])
+                        with open(split['name'], "wb") as fbuffer:
+                            bar = util.progressbar(expected_size=split_total_size, hide=not self.progress_bar)
+                            for index, chunk in enumerate(split["file"]["data"]):
+                                fbuffer.write(chunk)
+                                bar.show(index * split_chunk_size)
+                            bar.done()
+            except IOError as exc:
+                logger.error("Error while writing %s : %s", packagename, exc)
+                failed_downloads.append((item, exc))
 
         success_items = set(success_downloads)
-        failed_items = set([item[0] for item, error in failed_downloads])
+        failed_items  = set([item[0] for item, error in failed_downloads])
         unavail_items = set([item[0] for item, error in unavail_downloads])
-        to_download_items = set([item[0] for item in list_of_packages_to_download])
+        to_download_items = set([item[0] for item in pkg_todownload])
 
-        return_function(failed_downloads + unavail_downloads)
+        self.write_logfiles(success_items, failed_items, unavail_items)
+        self.print_failed(failed_downloads + unavail_downloads)
         return to_download_items - failed_items
 
-    @staticmethod
-    def after_download(failed_downloads):
-        # Info message
-        if not failed_downloads:
-            message = "Download complete"
-        else:
-            message = "A few packages could not be downloaded :"
-            for item, exception in failed_downloads:
-                package_name, filename = item
-                if filename is not None:
-                    message += "\n%s : %s" % (filename, package_name)
-                else:
-                    message += "\n%s" % package_name
-                message += "\n%s\n" % exception
+    @hooks.connected
+    def search(self, search_string, free_only=True, include_headers=True):
+        """
+        Search the given string search_string on the Play Store.
 
-        print(message)
-
-    def raw_search(self, results_list, search_string, nb_results):
-        # Query results
-        return self.playstore_api.search(search_string, nb_result=nb_results)
-
-    def search(self, results_list, search_string, nb_results, free_only=True, include_headers=True):
+        search_string   -- the string to search on the Play Store
+        free_only       -- True if only costless apps should be searched for
+        include_headers -- True if the result table should show column names
+        """
         try:
-            results = self.raw_search(results_list, search_string, nb_results)
+            results = self.api.search(search_string)
         except IndexError:
-            results = list()
+            results = []
         if not results:
-            print("No result")
+            logger.info("No result")
             return
-        all_results = list()
+        all_results = []
         if include_headers:
             # Name of the columns
             col_names = ["Title", "Creator", "Size", "Downloads", "Last Update", "AppID", "Version", "Rating"]
             all_results.append(col_names)
         # Compute results values
-        for result in results:
-            if free_only and result['offer'][0]['checkoutFlowRequired']:  # if not Free to download
-                continue
-            l = [result['title'],
-                 result['author'],
-                 util.sizeof_fmt(result['installationSize']),
-                 result['numDownloads'],
-                 result['uploadDate'],
-                 result['docId'],
-                 result['versionCode'],
-                 "%.2f" % result["aggregateRating"]["starRating"]
-                ]
-            if len(all_results) < int(nb_results) + 1:
-                all_results.append(l)
+        for doc in results:
+            for cluster in doc["child"]:
+                for app in cluster["child"]:
+                    # skip that app if it not free
+                    # or if it's beta (pre-registration)
+                    if ('offer' not in app  # beta apps (pre-registration)
+                            or free_only
+                            and app['offer'][0]['checkoutFlowRequired']  # not free to download
+                    ):
+                        continue
+                    details = app['details']['appDetails']
+                    detail = [app['title'],
+                              app['creator'],
+                              util.sizeof_fmt(int(details['installationSize']))
+                              if int(details['installationSize']) > 0 else 'N/A',
+                              details['numDownloads'],
+                              details['uploadDate'],
+                              app['docid'],
+                              details['versionCode'],
+                              "%.2f" % app["aggregateRating"]["starRating"]
+                              ]
+                    all_results.append(detail)
 
-        if self.verbose:
-            # Print a nice table
-            col_width = list()
-            for column_indice in range(len(all_results[0])):
-                col_length = max([len("%s" % row[column_indice]) for row in all_results])
-                col_width.append(col_length + 2)
+        # Print a nice table
+        col_width = []
+        for column_indice in range(len(all_results[0])):
+            col_length = max([len("%s" % row[column_indice]) for row in all_results])
+            col_width.append(col_length + 2)
 
-            for result in all_results:
-                print("".join(str("%s" % item).strip().ljust(col_width[indice]) for indice, item in
-                              enumerate(result)))
+        for result in all_results:
+            for indice, item in enumerate(result):
+                out = "".join(str(item).strip().ljust(col_width[indice]))
+                try:
+                    print(out, end='')
+                except UnicodeEncodeError:
+                    out = out.encode('utf-8', errors='replace')
+                    print(out, end='')
+            print()
         return all_results
 
-    def download_packages(self, list_of_packages_to_download):
-        self.download_selection(self.playstore_api, [(pkg, None) for pkg in list_of_packages_to_download],
-                                self.after_download)
+    ########## End public methods ##########
 
-    def get_package_info(self, package):
-        return self.playstore_api.details(package)
+    ########## Internal methods ##########
+
+    def connect(self):
+        """
+        Connect GplayCli to the Google Play API.
+        If self.token_enable=True, the token from
+        self.retrieve_token is used. Else, classical
+        credentials are used. They might be stored
+        into the keyring if the keyring package
+        is installed.
+        """
+        self.api = GooglePlayAPI(locale=self.locale, timezone=self.timezone, device_codename=self.device_codename)
+        if self.token_enable:
+            self.retrieve_token()
+            return self.connect_token()
+        else:
+            ok, err = self.connect_credentials()
+            if ok:
+                self.token = self.api.authSubToken
+                self.gsfid = self.api.gsfId
+            return ok, err
+
+    def connect_token(self):
+        if self.token_passed:
+            logger.info("Using passed token to connect to API")
+        else:
+            logger.info("Using auto retrieved token to connect to API")
+        try:
+            self.api.login(authSubToken=self.token, gsfId=int(self.gsfid, 16))
+        except (ValueError, IndexError, LoginError, DecodeError, SystemError, RequestError):
+            logger.info("Token has expired or is invalid. Retrieving a new one...")
+            self.retrieve_token(force_new=True)
+            self.connect()
+        return True, None
+
+    def connect_credentials(self):
+        logger.info("Using credentials to connect to API")
+        if self.gmail_password:
+            logger.info("Using plaintext password")
+            password = self.gmail_password
+        elif self.keyring_service and HAVE_KEYRING:
+            password = keyring.get_password(self.keyring_service, self.gmail_address)
+        elif self.keyring_service and not HAVE_KEYRING:
+            logger.error("You asked for keyring service but keyring package is not installed")
+            return False, ERRORS.KEYRING_NOT_INSTALLED
+        else:
+            logger.error("No password found. Check your configuration file.")
+            return False, ERRORS.CANNOT_LOGIN_GPLAY
+        try:
+            self.api.login(email=self.gmail_address, password=password)
+        except LoginError as e:
+            logger.error("Bad authentication, login or password incorrect (%s)", e)
+            return False, ERRORS.CANNOT_LOGIN_GPLAY
+        return True, None
+
+
+    def get_cached_token(self):
+        """
+        Retrieve a cached token,  gsfid and device if exist.
+        Otherwise return None.
+        """
+        try:
+            cache_dic = json.loads(open(self.tokencachefile).read())
+            token = cache_dic['token']
+            gsfid = cache_dic['gsfid']
+            address = cache_dic['address']
+        except (IOError, ValueError, KeyError) as e:  # cache file does not exists or is corrupted
+            print(e)
+            token = None
+            gsfid = None
+            address = None
+            logger.info('Cache file does not exists or is corrupted')
+        return token, gsfid, address
+
+    def write_cached_token(self, token, gsfid, address):
+        """
+        Write the given token, gsfid and device
+        to the self.tokencachefile file.
+        Path and file are created if missing.
+        """
+        cachedir = os.path.dirname(self.tokencachefile)
+        if not cachedir:
+            cachedir = os.getcwd()
+        # creates cachedir if not exists
+        if not os.path.exists(cachedir):
+            os.makedirs(cachedir, exist_ok=True)
+        with open(self.tokencachefile, 'w') as tcf:
+            tcf.write(json.dumps({'token' : token,
+                                  'gsfid' : gsfid,
+                                  'address' : address}))
+
+    def prepare_analyse_apks(self):
+        """
+        Gather apks to further check for update
+        """
+        list_of_apks = util.list_folder_apks(self.download_folder)
+        if not list_of_apks:
+            return
+        logger.info("Checking apks ...")
+        to_update = self.analyse_local_apks(list_of_apks, self.download_folder)
+        return self.prepare_download_updates(to_update)
+
+    @hooks.connected
+    def analyse_local_apks(self, list_of_apks, download_folder):
+        """
+        Analyse apks in the list list_of_apks
+        to check for updates and download updates
+        in the download_folder folder.
+        """
+        list_apks_to_update = []
+        package_bunch = []
+        version_codes = []
+        unavail_items = []
+        UNAVAIL = "This app is not available in the Play Store"
+        for filename in list_of_apks:
+            filepath = os.path.join(download_folder, filename)
+            logger.info("Analyzing %s", filepath)
+            apk = APK(filepath)
+            packagename = apk.package
+            package_bunch.append(packagename)
+            version_codes.append(util.vcode(apk.version_code))
+
+        # BulkDetails requires only one HTTP request
+        # Get APK info from store
+        details = self.api.bulkDetails(package_bunch)
+        for detail, packagename, filename, apk_version_code in zip(details, package_bunch, list_of_apks, version_codes):
+            # this app is not in the play store
+            if not detail:
+                unavail_items.append(((packagename, filename), UNAVAIL))
+                continue
+            store_version_code = detail['details']['appDetails']['versionCode']
+
+            # Compare
+            if apk_version_code < store_version_code:
+                # Add to the download list
+                list_apks_to_update.append([packagename, filename, apk_version_code, store_version_code])
+
+        self.write_logfiles(None, None, [item[0][0] for item in unavail_items])
+        self.print_failed(unavail_items)
+
+        return list_apks_to_update
+
+    def prepare_download_updates(self, list_apks_to_update):
+        """
+        Ask confirmation before updating apks
+        """
+        if not list_apks_to_update:
+            print("Everything is up to date !")
+            return False
+
+        pkg_todownload = []
+
+        # Ask confirmation before downloading
+        print("The following applications will be updated :")
+        for packagename, filename, apk_version_code, store_version_code in list_apks_to_update:
+            print("%s Version : %s -> %s" % (filename, apk_version_code, store_version_code))
+            pkg_todownload.append([packagename, filename])
+
+        if not self.yes:
+            print("Do you agree?")
+            return_value = input('y/n ?')
+
+        if self.yes or return_value == 'y':
+            logger.info("Downloading ...")
+            downloaded_packages = self.download(pkg_todownload)
+            return_string = ' '.join(downloaded_packages)
+            print("Updated: %s" % return_string)
+        return True
+
+    @staticmethod
+    def print_failed(failed_downloads):
+        """
+        Print/log failed downloads from failed_downloads
+        """
+        # Info message
+        if not failed_downloads:
+            return
+        else:
+            message = "A few packages could not be downloaded :\n"
+            for pkg, exception in failed_downloads:
+                package_name, filename = pkg
+                if filename is not None:
+                    message += "%s : %s\n" % (filename, package_name)
+                else:
+                    message += "%s\n" % package_name
+                message += "%s\n" % exception
+            logger.error(message)
 
     def write_logfiles(self, success, failed, unavail):
-        for result, logfile in [(success, self.success_logfile),
-                                (failed, self.failed_logfile),
-                                (unavail, self.unavail_logfile)
-                               ]:
-            if result:
-                with open(logfile, 'w') as _buffer:
-                    for package in result:
-                        print(package, file=_buffer)
+        """
+        Write success failed and unavail list to
+        logfiles
+        """
+        if not self.logging_enable:
+            return
+        for result, logfile in [(success, self.success_logfile), (failed, self.failed_logfile), (unavail, self.unavail_logfile)]:
+            if not result:
+                continue
+            with open(logfile, 'w') as _buffer:
+                for package in result:
+                    print(package, file=_buffer)
 
-
-def install_cronjob(automatic=False):
-    cred_default = '/etc/gplaycli/gplaycli.conf'
-    fold_default = '/opt/apks'
-    frequence_default = "/etc/cron.daily"
-
-    if not automatic:
-        credentials = input('path to gplaycli.conf? let empty for ' + cred_default + '\n') or cred_default
-        folder_to_update = input('path to apks folder? let empty for ' + fold_default + '\n') or fold_default
-        frequence = input('update it [d]aily or [w]eekly?\n')
-        if frequence == 'd':
-            frequence_folder = '/etc/cron.daily'
-        elif frequence == 'w':
-            frequence_folder = '/etc/cron.weekly'
-        else:
-            raise Exception('please type d/w to make your choice')
-
-    else:
-        credentials = cred_default
-        folder_to_update = fold_default
-        frequence_folder = frequence_default
-
-    frequence_file = frequence_folder + '/gplaycli'
-    shutil.copyfile('/etc/gplaycli/cronjob', frequence_file)
-
-    with open('/etc/gplaycli/cronjob', 'r') as fi:
-        with open(frequence_file, 'w') as fo:
-            for line in fi:
-                line = line.replace('PL_FOLD', folder_to_update)
-                line = line.replace('PL_CRED', credentials)
-                fo.write(line)
-
-    st = os.stat(frequence_file)
-    os.chmod(frequence_file, st.st_mode | stat.S_IEXEC)
-    print('Cronjob installed at ' + frequence_file)
-    return ERRORS.OK
-
-
-def load_from_file(filename):
-    return [package.strip('\r\n') for package in open(filename).readlines()]
+########## End internal methods ##########
 
 
 def main():
+    """
+    Main function.
+    Parse command line arguments
+    """
     parser = argparse.ArgumentParser(description="A Google Play Store Apk downloader and manager for command line")
-    parser.add_argument('-V', '--version', action='store_true', dest='version', help='Print version number and exit')
-    parser.add_argument('-y', '--yes', action='store_true', dest='yes_to_all', help='Say yes to all prompted questions')
-    parser.add_argument('-l', '--list', action='store', dest='list', metavar="FOLDER",
-                        type=str, help="List APKS in the given folder, with details")
-    parser.add_argument('-s', '--search', action='store', dest='search_string', metavar="SEARCH",
-                        type=str, help="Search the given string in Google Play Store")
-    parser.add_argument('-P', '--paid', action='store_true', dest='paid',
-                        default=False, help='Also search for paid apps')
-    parser.add_argument('-n', '--number', action='store', dest='number_results', metavar="NUMBER",
-                        type=int, help="For the search option, returns the given number of matching applications")
-    parser.add_argument('-d', '--download', action='store', dest='packages_to_download', metavar="AppID", nargs="+",
-                        type=str, help="Download the Apps that map given AppIDs")
-    parser.add_argument('-a', '--additional-files', action='store_true', dest='addfiles_enable',
-                        default=False, help="Enable the download of additional files")
-    parser.add_argument('-F', '--file', action='store', dest='load_from_file', metavar="FILE",
-                        type=str, help="Load packages to download from file, one package per line")
-    parser.add_argument('-u', '--update', action='store', dest='update_folder', metavar="FOLDER",
-                        type=str, help="Update all APKs in a given folder")
-    parser.add_argument('-f', '--folder', action='store', dest='dest_folder', metavar="FOLDER", nargs=1,
-                        type=str, default=".", help="Where to put the downloaded Apks, only for -d command")
-    parser.add_argument('-dc', '--device-codename', action='store', dest='device_codename', metavar="DEVICE_CODENAME",
-                        type=str, default="bacon", help="The device codename to fake", choices=GooglePlayAPI.getDevicesCodenames())
-    parser.add_argument('-t', '--token', action='store_true', dest='token_enable', default=None,
-                        help='Instead of classical credentials, use the tokenize version')
-    parser.add_argument('-tu', '--token-url', action='store', dest='token_url', metavar="TOKEN_URL",
-                        type=str, default=None, help="Use the given tokendispenser URL to retrieve a token")
-    parser.add_argument('-v', '--verbose', action='store_true', dest='verbose', help='Be verbose')
-    parser.add_argument('-c', '--config', action='store', dest='config', metavar="CONF_FILE", nargs=1,
-                        type=str, default=None, help="Use a different config file than gplaycli.conf")
-    parser.add_argument('-p', '--progress', action='store_true', dest='progress_bar',
-                        help='Prompt a progress bar while downloading packages')
-    parser.add_argument('-ic', '--install-cronjob', action='store_true', dest='install_cronjob',
-                        help='Install cronjob for regular APKs update. Use --yes to automatically install to default locations')
+    parser.add_argument('-V',  '--version',				help="Print version number and exit", action='store_true')
+    parser.add_argument('-v',  '--verbose',				help="Be verbose", action='store_true')
+    parser.add_argument('-s',  '--search',				help="Search the given string in Google Play Store", metavar="SEARCH")
+    parser.add_argument('-d',  '--download',			help="Download the Apps that map given AppIDs", metavar="AppID", nargs="+")
+    parser.add_argument('-y',  '--yes',					help="Say yes to all prompted questions", action='store_true')
+    parser.add_argument('-l',  '--list',				help="List APKS in the given folder, with details", metavar="FOLDER")
+    parser.add_argument('-P',  '--paid',				help="Also search for paid apps", action='store_true', default=False)
+    parser.add_argument('-av', '--append-version',		help="Append versionstring to APKs when downloading", action='store_true')
+    parser.add_argument('-a',  '--additional-files',	help="Enable the download of additional files", action='store_true', default=False)
+    parser.add_argument('-F',  '--file',				help="Load packages to download from file, one package per line", metavar="FILE")
+    parser.add_argument('-u',  '--update',				help="Update all APKs in a given folder", metavar="FOLDER")
+    parser.add_argument('-f',  '--folder',				help="Where to put the downloaded Apks, only for -d command", metavar="FOLDER", nargs=1, default=['.'])
+    parser.add_argument('-dc', '--device-codename',		help="The device codename to fake", choices=GooglePlayAPI.getDevicesCodenames(), metavar="DEVICE_CODENAME")
+    parser.add_argument('-t',  '--token',				help="Instead of classical credentials, use the tokenize version", action='store_true', default=None)
+    parser.add_argument('-tu', '--token-url',			help="Use the given tokendispenser URL to retrieve a token", metavar="TOKEN_URL")
+    parser.add_argument('-ts', '--token-str',			help="Supply token string by yourself, need to supply GSF_ID at the same time", metavar="TOKEN_STR")
+    parser.add_argument('-g',  '--gsfid',				help="Supply GSF_ID by yourself, need to supply token string at the same time", metavar="GSF_ID")
+    parser.add_argument('-c',  '--config',				help="Use a different config file than gplaycli.conf", metavar="CONF_FILE", nargs=1)
+    parser.add_argument('-p',  '--progress',			help="Prompt a progress bar while downloading packages", action='store_true')
+    parser.add_argument('-L',  '--log',					help="Enable logging of apps status in separate logging files", action='store_true', default=False)
 
     if len(sys.argv) < 2:
         sys.argv.append("-h")
@@ -471,34 +640,26 @@ def main():
         print(__version__)
         return
 
-    if args.install_cronjob:
-        sys.exit(install_cronjob(args.yes_to_all))
-
     cli = GPlaycli(args, args.config)
-    success, error = cli.connect_to_googleplay_api()
-    if not success:
-        sys.exit(ERRORS.CANNOT_LOGIN_GPLAY)
 
     if args.list:
-        print(cli.list_folder_apks(args.list))
+        print(util.list_folder_apks(args.list))
 
-    if args.update_folder:
+    if args.update:
         cli.prepare_analyse_apks()
+        return
 
-    if args.search_string:
+    if args.search:
         cli.verbose = True
-        nb_results = 10
-        if args.number_results:
-            nb_results = args.number_results
-        cli.search(list(), args.search_string, nb_results, not args.paid)
+        cli.search(args.search, not args.paid)
 
-    if args.load_from_file:
-        args.packages_to_download = load_from_file(args.load_from_file)
+    if args.file:
+        args.download = util.load_from_file(args.file)
 
-    if args.packages_to_download is not None:
-        if args.dest_folder is not None:
-            cli.set_download_folder(args.dest_folder[0])
-        cli.download_packages(args.packages_to_download)
+    if args.download is not None:
+        if args.folder is not None:
+            cli.download_folder = args.folder[0]
+        cli.download(args.download)
 
 
 if __name__ == '__main__':
