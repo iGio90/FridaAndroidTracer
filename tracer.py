@@ -138,7 +138,7 @@ if apk_file is not None:
         report["details"] = store_info['details']['appDetails']
         for image in store_info["image"]:
             if image["imageType"] == 4:
-                report["store_info"]["icon_url"] = image["imageUrl"]
+                report["details"]["icon_url"] = image["imageUrl"]
 
 # install the app
 if apk_file:
