@@ -1,5 +1,8 @@
-A framework built on top o f Frida that generates a JSON report of the given Android application. 
-It trace api involved with sensitive information, network requests, receivers and more 
+A framework built on top of Frida that generates a JSON report of the given Android application. 
+
+It traces api involved with sensitive information, network requests, receivers and more.
+
+Here an [example output](https://gist.github.com/iGio90/1ccf624ff0f55608b061985c03e61cae)
 
 ```
     Copyright (C) 2020 Giovanni - iGio90 - Rocca
