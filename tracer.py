@@ -126,7 +126,6 @@ if apk_file is not None:
         "services": apk_info.get_services(),
         "receivers": apk_info.get_receivers(),
         "providers": apk_info.get_providers(),
-        "permissions": apk_info.get_permissions(),
         "certificates": []
     }
 
