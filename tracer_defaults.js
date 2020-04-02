@@ -29,10 +29,7 @@ traceMethod("android.content.ContentResolver.query", onDumpContentResolverHookMe
 
 traceMethod("javax.crypto.Cipher.doFinal", cipherHookMethodPerform);
 
-traceClassCtor("java.io.File", {
-    "stringsOnly": true,
-    "backtrace": false
-});
+traceClassCtor("java.io.File", onHookFileCtor);
 
 traceNativeFunct("libc.so", "open", function (args) {
     var path = Memory.readUtf8String(args[0]);

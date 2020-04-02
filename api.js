@@ -33,36 +33,18 @@ function traceMethod(targetClassMethod, onPerformingHook) {
     }
 }
 
-function traceClassCtor(className, configs) {
+function traceClassCtor(className, onPerformingHook) {
     var hook = Java.use(className);
     var overloadCount = hook["$init"].overloads.length;
 
     console.log("[*] Tracing java CTor " + className + " [" + overloadCount + " overload(s)]");
-
     for (var i = 0; i < overloadCount; i++) {
         hook["$init"].overloads[i].implementation = function() {
             var retval = this["$init"].apply(this, arguments);
-
             var args = arguments;
+            var context = this;
             Java.perform(function() {
-                var hookMsg = {
-                    "function": className,
-                    "struct": {}
-                };
-
-                hookMsg["struct"]["args"] = [];
-                for (var j = 0; j < args.length; j++) {
-                    if (configs["stringsOnly"] && typeof args[j] == 'string' || args[j] instanceof String)
-                        hookMsg["struct"]["args"].push(args[j]);
-                    else if (configs["stringsOnly"])
-                        hookMsg["struct"]["args"].push(args[j]);
-                }
-
-                if (configs["backtrace"]) {
-                    hookMsg["struct"]["backtrace"] = Java.use("android.util.Log")
-                        .getStackTraceString(Java.use("java.lang.Exception").$new());
-                }
-                send(hookMsg);
+                onPerformingHook(className, args, context);
             });
 
             return retval;
@@ -275,6 +257,35 @@ function onDumpContentResolverHookMethodPerform(targetClassMethod, args) {
             .getStackTraceString(Java.use("java.lang.Exception").$new());
         send(hookMsg);
     }
+}
+
+function onHookFileCtor(targetClass, args, context) {
+    var hookMsg = {
+        "function": targetClass,
+        "struct": {
+            'args': []
+        }
+    };
+
+    if (args.length === 1) {
+        hookMsg["struct"]["args"].push(args[0]);
+    } else {
+        for (var j = 0; j < args.length; j++) {
+            if (typeof args[j] === 'string') {
+                hookMsg["struct"]["args"].push(args[j]);
+            } else {
+                if (typeof args[j].path !== 'undefined') {
+                    hookMsg["struct"]["args"].push(args[j].path.value);
+                } else {
+                    hookMsg["struct"]["args"].push(JSON.stringify(args[j]));
+                }
+            }
+        }
+    }
+
+    hookMsg["struct"]["backtrace"] = Java.use("android.util.Log")
+        .getStackTraceString(Java.use("java.lang.Exception").$new());
+    send(hookMsg);
 }
 
 function exist(src, val) {
