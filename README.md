@@ -4,6 +4,21 @@ It traces api involved with sensitive information, network requests, receivers a
 
 Here an [example output](https://gist.github.com/iGio90/1ccf624ff0f55608b061985c03e61cae)
 
+##### Setup
+
+```
+git clone https://github.com/iGio90/FridaAndroidTracer
+cd FridaAndroidTracer
+python3 setup.py install
+```
+
+##### Run
+
+```
+usage: tracer.py [-h] -p PACKAGE [-pd] [-f FILE_PATH] [-s SCRIPT_PATH]
+tracer.py: error: the following arguments are required: -p/--package
+```
+
 ```
     Copyright (C) 2020 Giovanni - iGio90 - Rocca
     This program is free software: you can redistribute it and/or modify
