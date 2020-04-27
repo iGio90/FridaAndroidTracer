@@ -212,12 +212,8 @@ function onDumpIntentHookMethodPerform(targetClassMethod, args) {
             } catch (err) {}
         }
 
-        var intent = Java.use("android.content.Intent");
-        var pt = ptr(args[0]["$handle"]);
-        var intentCls = Java.cast(pt, intent);
-
-        hookMsg["struct"]["action"] = intentCls.getAction();
-        hookMsg["struct"]["target_component"] = intentCls.getComponent().toString();
+        hookMsg["struct"]["action"] = args[0].getAction();
+        hookMsg["struct"]["target_component"] = args[0].getComponent().toString();
         hookMsg["struct"]["backtrace"] = Java.use("android.util.Log")
             .getStackTraceString(Java.use("java.lang.Exception").$new());
         send(hookMsg);
